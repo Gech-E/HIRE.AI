@@ -1,0 +1,107 @@
+# Trigger reload
+import os
+import json
+import urllib.request
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import jwt
+from database import get_db
+from sqlalchemy.orm import Session
+from models import User
+from dotenv import load_dotenv
+
+load_dotenv()
+
+auth_scheme = HTTPBearer(auto_error=False)
+
+# For production, you should set CLERK_FRONTEND_API in your .env
+# Example: CLERK_FRONTEND_API=https://clerk.yourdomain.com
+CLERK_FRONTEND_API = os.getenv("CLERK_FRONTEND_API", "")
+CLERK_SECRET_KEY = os.getenv("CLERK_SECRET_KEY", "")
+
+# We fetch JWKS once and cache it in memory to avoid requesting it every time
+_jwks_cache = None
+
+def get_jwks():
+    global _jwks_cache
+    if _jwks_cache:
+        return _jwks_cache
+        
+    if not CLERK_FRONTEND_API and not CLERK_SECRET_KEY:
+        # Fallback for local testing if keys aren't set properly
+        return {"keys": []}
+        
+    jwks_url = f"{CLERK_FRONTEND_API}/.well-known/jwks.json"
+    
+    try:
+        req = urllib.request.Request(jwks_url)
+        with urllib.request.urlopen(req) as response:
+            _jwks_cache = json.loads(response.read())
+            return _jwks_cache
+    except Exception as e:
+        print(f"Error fetching JWKS from {jwks_url}: {e}")
+        return {"keys": []}
+
+def verify_token(token: str):
+    # During early developement, if no secret/frontend API is set, we bypass strict JWKS
+    if not CLERK_FRONTEND_API or CLERK_FRONTEND_API == "your_clerk_frontend_api":
+        try:
+            return jwt.get_unverified_claims(token)
+        except:
+            pass
+
+    jwks = get_jwks()
+    try:
+        unverified_header = jwt.get_unverified_header(token)
+        rsa_key = {}
+        for key in jwks.get("keys", []):
+            if key["kid"] == unverified_header.get("kid"):
+                rsa_key = {
+                    "kty": key["kty"],
+                    "kid": key["kid"],
+                    "use": key["use"],
+                    "n": key["n"],
+                    "e": key["e"]
+                }
+                break
+
+        if rsa_key:
+            payload = jwt.decode(
+                token,
+                rsa_key,
+                algorithms=["RS256"],
+                options={"verify_aud": False}
+            )
+            return payload
+            
+        # Fallback: decode unverified for dev environments
+        return jwt.get_unverified_claims(token)
+    except Exception as e:
+        print("Token verification failed:", e)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid authentication credentials: {str(e)}",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(auth_scheme), db: Session = Depends(get_db)):
+    if not credentials:
+        # Allow unauthorized users to be represented as null, useful for mixed public/private endpoints
+        return None
+        
+    token = credentials.credentials
+    payload = verify_token(token)
+    
+    clerk_id = payload.get("sub")
+    if not clerk_id:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+    
+    user = db.query(User).filter(User.clerk_id == clerk_id).first()
+    
+    if not user:
+        # Instead of throwing a 401 error right away if the user is completely missing in our DB,
+        # we can return a transient dict or allow the '/api/users/sync' endpoint to complete later.
+        # But generally, strict auth means throwing:
+         raise HTTPException(status_code=401, detail="User not found in local database. Please sync.")
+        
+    return user
