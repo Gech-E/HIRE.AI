@@ -62,12 +62,26 @@ def sync_user(
             clerk_id=clerk_id,
             email=payload.get("email") or f"{clerk_id}@placeholder.com",
             full_name=payload.get("name") or "New User",
-            role="recruiter",
+            role="unassigned",
         )
         db.add(user)
         db.commit()
         db.refresh(user)
     return {"status": "success", "user_id": user.id, "role": user.role}
+
+
+@app.put("/api/users/role")
+def update_user_role(
+    role_update: schemas.UserRoleUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_auth),
+):
+    if role_update.role not in ["candidate", "recruiter"]:
+        raise HTTPException(status_code=400, detail="Invalid role")
+    current_user.role = role_update.role
+    db.commit()
+    db.refresh(current_user)
+    return {"status": "success", "role": current_user.role}
 
 
 # ── Jobs ──────────────────────────────────────────────
@@ -156,6 +170,11 @@ def create_application(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(require_auth),
 ):
+    # Verify job exists
+    job = db.query(models.Job).filter(models.Job.id == app_data.job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
     # Check for duplicate application
     existing = (
         db.query(models.Application)

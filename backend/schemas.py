@@ -42,6 +42,10 @@ class UserOut(UserBase):
         from_attributes = True
 
 
+class UserRoleUpdate(BaseModel):
+    role: str
+
+
 # ── Company ───────────────────────────────────────────
 class CompanyBase(BaseModel):
     name: str
