@@ -1,12 +1,13 @@
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from typing import List, Optional
 from database import get_db
 from fastapi.security import HTTPAuthorizationCredentials
 import models
 import schemas
-from auth import get_current_user, verify_token, auth_scheme
+from auth import get_current_user, require_auth, verify_token, auth_scheme
 
 app = FastAPI(
     title="Hire.ai Platform API",
@@ -14,10 +15,14 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# Locked CORS — only allow the Next.js frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -29,28 +34,35 @@ def read_root():
 
 
 @app.get("/health")
-def health_check():
-    return {"status": "ok"}
+def health_check(db: Session = Depends(get_db)):
+    try:
+        db.execute(func.now())
+        return {"status": "ok", "database": "connected"}
+    except Exception as e:
+        return {"status": "error", "database": str(e)}
 
 
 # ── Users ──────────────────────────────────────────────
 @app.post("/api/users/sync")
-def sync_user(credentials: HTTPAuthorizationCredentials = Depends(auth_scheme), db: Session = Depends(get_db)):
+def sync_user(
+    credentials: HTTPAuthorizationCredentials = Depends(auth_scheme),
+    db: Session = Depends(get_db),
+):
     if not credentials:
         raise HTTPException(status_code=401, detail="No token provided")
-    
+
     payload = verify_token(credentials.credentials)
     clerk_id = payload.get("sub")
     if not clerk_id:
         raise HTTPException(status_code=401, detail="Invalid token")
-        
+
     user = db.query(models.User).filter(models.User.clerk_id == clerk_id).first()
     if not user:
         user = models.User(
             clerk_id=clerk_id,
             email=payload.get("email") or f"{clerk_id}@placeholder.com",
             full_name=payload.get("name") or "New User",
-            role="recruiter", # default for simplification
+            role="recruiter",
         )
         db.add(user)
         db.commit()
@@ -60,10 +72,11 @@ def sync_user(credentials: HTTPAuthorizationCredentials = Depends(auth_scheme), 
 
 # ── Jobs ──────────────────────────────────────────────
 @app.post("/api/jobs", response_model=schemas.JobOut)
-def create_job(job: schemas.JobCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    if not current_user:
-        raise HTTPException(status_code=401, detail="Authentication required")
-        
+def create_job(
+    job: schemas.JobCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_auth),
+):
     db_job = models.Job(
         title=job.title,
         description=job.description,
@@ -88,7 +101,7 @@ def list_jobs(
     location: Optional[str] = None,
     job_type: Optional[str] = None,
     skip: int = 0,
-    limit: int = 20,
+    limit: int = Query(default=20, le=100),
     db: Session = Depends(get_db),
 ):
     query = db.query(models.Job)
@@ -101,6 +114,20 @@ def list_jobs(
     return query.offset(skip).limit(limit).all()
 
 
+@app.get("/api/jobs/my", response_model=List[schemas.JobOut])
+def list_my_jobs(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_auth),
+):
+    """List jobs posted by the current authenticated recruiter."""
+    return (
+        db.query(models.Job)
+        .filter(models.Job.recruiter_id == current_user.id)
+        .order_by(models.Job.created_at.desc())
+        .all()
+    )
+
+
 @app.get("/api/jobs/{job_id}", response_model=schemas.JobOut)
 def get_job(job_id: int, db: Session = Depends(get_db)):
     job = db.query(models.Job).filter(models.Job.id == job_id).first()
@@ -110,16 +137,39 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/api/jobs/{job_id}/applicants", response_model=List[schemas.ApplicationOut])
-def get_job_applicants(job_id: int, db: Session = Depends(get_db)):
-    return db.query(models.Application).filter(models.Application.job_id == job_id).all()
+def get_job_applicants(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_auth),
+):
+    return (
+        db.query(models.Application)
+        .filter(models.Application.job_id == job_id)
+        .all()
+    )
 
 
 # ── Applications ──────────────────────────────────────
 @app.post("/api/applications", response_model=schemas.ApplicationOut)
-def create_application(app_data: schemas.ApplicationCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    if not current_user:
-        raise HTTPException(status_code=401, detail="Authentication required")
-        
+def create_application(
+    app_data: schemas.ApplicationCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_auth),
+):
+    # Check for duplicate application
+    existing = (
+        db.query(models.Application)
+        .filter(
+            models.Application.candidate_id == current_user.id,
+            models.Application.job_id == app_data.job_id,
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=400, detail="You have already applied to this job."
+        )
+
     db_app = models.Application(
         candidate_id=current_user.id,
         job_id=app_data.job_id,
@@ -138,6 +188,7 @@ def create_application(app_data: schemas.ApplicationCreate, db: Session = Depend
 def list_applications(
     status: Optional[str] = None,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_auth),
 ):
     query = db.query(models.Application)
     if status:
@@ -150,11 +201,16 @@ def update_application_status(
     app_id: int,
     update: schemas.ApplicationStatusUpdate,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_auth),
 ):
-    db_app = db.query(models.Application).filter(models.Application.id == app_id).first()
+    db_app = (
+        db.query(models.Application)
+        .filter(models.Application.id == app_id)
+        .first()
+    )
     if not db_app:
         raise HTTPException(status_code=404, detail="Application not found")
-    db_app.status = update.status
+    db_app.status = update.status.value
     db.commit()
     db.refresh(db_app)
     return db_app
@@ -162,7 +218,11 @@ def update_application_status(
 
 # ── Assessments ───────────────────────────────────────
 @app.post("/api/assessments", response_model=schemas.AssessmentOut)
-def create_assessment(assessment: schemas.AssessmentCreate, db: Session = Depends(get_db)):
+def create_assessment(
+    assessment: schemas.AssessmentCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_auth),
+):
     # Mock AI-generated questions
     mock_questions = [
         {
@@ -191,8 +251,16 @@ def create_assessment(assessment: schemas.AssessmentCreate, db: Session = Depend
 
 
 @app.get("/api/assessments/{assessment_id}", response_model=schemas.AssessmentOut)
-def get_assessment(assessment_id: int, db: Session = Depends(get_db)):
-    assessment = db.query(models.Assessment).filter(models.Assessment.id == assessment_id).first()
+def get_assessment(
+    assessment_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_auth),
+):
+    assessment = (
+        db.query(models.Assessment)
+        .filter(models.Assessment.id == assessment_id)
+        .first()
+    )
     if not assessment:
         raise HTTPException(status_code=404, detail="Assessment not found")
     return assessment
@@ -200,7 +268,11 @@ def get_assessment(assessment_id: int, db: Session = Depends(get_db)):
 
 # ── Interviews ────────────────────────────────────────
 @app.post("/api/interviews", response_model=schemas.InterviewOut)
-def create_interview(interview: schemas.InterviewCreate, db: Session = Depends(get_db)):
+def create_interview(
+    interview: schemas.InterviewCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_auth),
+):
     db_interview = models.Interview(
         application_id=interview.application_id,
         scheduled_at=interview.scheduled_at,
@@ -213,28 +285,117 @@ def create_interview(interview: schemas.InterviewCreate, db: Session = Depends(g
 
 
 @app.get("/api/interviews/{interview_id}", response_model=schemas.InterviewOut)
-def get_interview(interview_id: int, db: Session = Depends(get_db)):
-    interview = db.query(models.Interview).filter(models.Interview.id == interview_id).first()
+def get_interview(
+    interview_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_auth),
+):
+    interview = (
+        db.query(models.Interview)
+        .filter(models.Interview.id == interview_id)
+        .first()
+    )
     if not interview:
         raise HTTPException(status_code=404, detail="Interview not found")
     return interview
 
 
+# ── Company ───────────────────────────────────────────
+@app.get("/api/company", response_model=schemas.CompanyOut)
+def get_my_company(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_auth),
+):
+    company = (
+        db.query(models.Company)
+        .filter(models.Company.owner_id == current_user.id)
+        .first()
+    )
+    if not company:
+        # Auto-create a default company for the user
+        company = models.Company(
+            name=current_user.company_name or "My Company",
+            owner_id=current_user.id,
+        )
+        db.add(company)
+        db.commit()
+        db.refresh(company)
+    return company
+
+
+@app.put("/api/company", response_model=schemas.CompanyOut)
+def update_my_company(
+    update: schemas.CompanyUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_auth),
+):
+    company = (
+        db.query(models.Company)
+        .filter(models.Company.owner_id == current_user.id)
+        .first()
+    )
+    if not company:
+        company = models.Company(
+            name=update.name or current_user.company_name or "My Company",
+            owner_id=current_user.id,
+        )
+        db.add(company)
+        db.commit()
+        db.refresh(company)
+
+    update_data = update.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(company, key, value)
+    db.commit()
+    db.refresh(company)
+    return company
+
+
 # ── Dashboard ─────────────────────────────────────────
 @app.get("/api/dashboard/stats", response_model=schemas.DashboardStats)
-def get_dashboard_stats(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    if not current_user:
-        raise HTTPException(status_code=401, detail="Authentication required")
-        
-    jobs_posted = db.query(models.Job).filter(models.Job.recruiter_id == current_user.id).count()
-    
+def get_dashboard_stats(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_auth),
+):
+    jobs_posted = (
+        db.query(models.Job)
+        .filter(models.Job.recruiter_id == current_user.id)
+        .count()
+    )
+
     # Get all job IDs posted by this recruiter
-    job_ids_query = db.query(models.Job.id).filter(models.Job.recruiter_id == current_user.id)
-    
-    total_apps = db.query(models.Application).filter(models.Application.job_id.in_(job_ids_query)).count()
-    shortlisted = db.query(models.Application).filter(models.Application.job_id.in_(job_ids_query), models.Application.status == "Shortlisted").count()
-    rejected = db.query(models.Application).filter(models.Application.job_id.in_(job_ids_query), models.Application.status == "Rejected").count()
-    recent_jobs = db.query(models.Job).filter(models.Job.recruiter_id == current_user.id).order_by(models.Job.created_at.desc()).limit(5).all()
+    job_ids_query = db.query(models.Job.id).filter(
+        models.Job.recruiter_id == current_user.id
+    )
+
+    total_apps = (
+        db.query(models.Application)
+        .filter(models.Application.job_id.in_(job_ids_query))
+        .count()
+    )
+    shortlisted = (
+        db.query(models.Application)
+        .filter(
+            models.Application.job_id.in_(job_ids_query),
+            models.Application.status == "Shortlisted",
+        )
+        .count()
+    )
+    rejected = (
+        db.query(models.Application)
+        .filter(
+            models.Application.job_id.in_(job_ids_query),
+            models.Application.status == "Rejected",
+        )
+        .count()
+    )
+    recent_jobs = (
+        db.query(models.Job)
+        .filter(models.Job.recruiter_id == current_user.id)
+        .order_by(models.Job.created_at.desc())
+        .limit(5)
+        .all()
+    )
 
     return schemas.DashboardStats(
         jobs_posted=jobs_posted,
