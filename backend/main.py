@@ -15,13 +15,16 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Locked CORS — only allow the Next.js frontend
+import os
+frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+allow_origins = [frontend_url]
+if frontend_url == "http://localhost:3000":
+    allow_origins.append("http://127.0.0.1:3000")
+
+# Locked CORS — only allow the configured frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

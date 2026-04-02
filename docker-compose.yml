@@ -1,0 +1,43 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: hire_db
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: hire_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  backend:
+    build: ./backend
+    container_name: hire_backend
+    restart: always
+    depends_on:
+      - db
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@db:5432/hire_db
+      - FRONTEND_URL=http://localhost:3000
+      - CLERK_SECRET_KEY=${CLERK_SECRET_KEY}
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build: ./frontend
+    container_name: hire_frontend
+    restart: always
+    depends_on:
+      - backend
+    environment:
+      - BACKEND_URL=http://backend:8000
+      - NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY}
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgres_data:
